@@ -26,13 +26,14 @@ class VkConfiguration(val configurationDescriptor: BackendConfigurationDescripto
   val accessKey = configurationDescriptor.backendConfig.getString("accessKey")
   val secretKey = configurationDescriptor.backendConfig.getString("secretKey")
   val runtimeConfig = configurationDescriptor.backendRuntimeAttributesConfig
-  var iamURL = s"https://iam.${region}.myhuaweicloud.com"
-  var cciURL = s"https://cci.${region}.myhuaweicloud.com"
-
-  if(region == "cn-north-7"){
-    iamURL = "https://iam.cn-north-7.ulanqab.huawei.com"
-    cciURL = "https://cci.cn-north-7.myhuaweicloud.com"
-  }
+  val iamURL = configurationDescriptor.backendConfig.getString("iamURL")
+  val k8sURL = configurationDescriptor.backendConfig.getString("k8sURL")
+//  var iamURL = s"https://iam.${region}.myhuaweicloud.com"
+//  var k8sURL = s"https://cci.${region}.myhuaweicloud.com"
+//  if(region == "cn-north-7"){
+//    iamURL = "https://iam.cn-north-7.ulanqab.huawei.com"
+//    k8sURL = "https://cci.cn-north-7.myhuaweicloud.com"
+//  }
   val token = Token(accessKey, secretKey, region, iamURL)
 
 }

@@ -1,18 +1,21 @@
 package cromwell.backend.impl.vk
 
+import java.security.cert.X509Certificate
 import java.util.Date
 import java.util.concurrent.{ExecutionException, TimeUnit}
 
 import akka.actor.{ActorContext, ActorSystem, Cancellable}
-import akka.http.scaladsl.Http
+import akka.http.scaladsl.{Http, HttpsConnectionContext}
 import akka.http.scaladsl.model.headers.RawHeader
 import akka.http.scaladsl.model.HttpRequest
 import akka.stream.ActorMaterializer
 import akka.util.ByteString
 import com.google.gson.{Gson, JsonObject, JsonParser}
+import com.typesafe.sslconfig.akka.AkkaSSLConfig
 import cromwell.core.CromwellFatalExceptionMarker
 import skuber.batch.Job
 import cromwell.core.retry.Retry._
+import javax.net.ssl.{KeyManager, SSLContext, X509TrustManager}
 
 import scala.collection.concurrent.TrieMap
 import scala.concurrent.duration._
@@ -72,7 +75,7 @@ final case class VkStatusItem(workflowId: String, context: ActorContext, vkConfi
 
   private val namespace = vkConfiguration.namespace
   //private val apiServerUrl = s"https://cci.${vkConfiguration.region}.myhuaweicloud.com"
-  private val apiServerUrl = vkConfiguration.cciURL
+  private val apiServerUrl = vkConfiguration.k8sURL
   def getStatus(jobId: String): Option[JsonObject] = {
     val ret = statusMap.get(jobId)
     if(ret.isEmpty) {
@@ -118,10 +121,43 @@ final case class VkStatusItem(workflowId: String, context: ActorContext, vkConfi
     }
   }
 
+  private val trustfulSslContext: SSLContext = {
+    object NoCheckX509TrustManager extends X509TrustManager {
+      override def checkClientTrusted(chain: Array[X509Certificate], authType: String) = ()
+      override def checkServerTrusted(chain: Array[X509Certificate], authType: String) = ()
+      override def getAcceptedIssuers = Array[X509Certificate]()
+    }
+    val context = SSLContext.getInstance("TLS")
+    context.init(Array[KeyManager](), Array(NoCheckX509TrustManager), null)
+    context
+  }
+
   private def makeRequest(request: HttpRequest): Future[JsonObject] = {
+    val badSslConfig: AkkaSSLConfig = AkkaSSLConfig().mapSettings(s =>
+      s.withLoose(
+        s.loose
+          .withAcceptAnyCertificate(true)
+          .withDisableHostnameVerification(true)
+      )
+    )
+    val http = Http()
+    val ctx = http.createClientHttpsContext(badSslConfig)
+    val httpsCtx = new HttpsConnectionContext(
+      trustfulSslContext,
+      ctx.sslConfig,
+      ctx.enabledCipherSuites,
+      ctx.enabledProtocols,
+      ctx.clientAuth,
+      ctx.sslParameters
+    )
     withRetry(() => {
       for {
-        response <- withRetry(() => Http().singleRequest(request))
+        response <- if (vkConfiguration.region == "cn-north-7"){
+          withRetry(() => Http().singleRequest(request, httpsCtx))
+        }else{
+          withRetry(() => Http().singleRequest(request))
+        }
+        // response <- withRetry(() => Http().singleRequest(request))
         data <- if (response.status.isFailure()) {
           response.entity.dataBytes.runFold(ByteString(""))(_ ++ _).map(_.utf8String) flatMap { errorBody =>
             Future.failed(new RuntimeException(s"Failed VK request: Code ${response.status.intValue()}, Body = $errorBody"))

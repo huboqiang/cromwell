@@ -5,7 +5,7 @@ import java.nio.file.FileAlreadyExistsException
 import java.util.concurrent.ExecutionException
 
 import akka.http.scaladsl.model.headers.RawHeader
-import akka.http.scaladsl.Http
+import akka.http.scaladsl.{Http, HttpsConnectionContext}
 import akka.http.scaladsl.marshalling.Marshal
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
 import akka.http.scaladsl.unmarshalling.{Unmarshal, Unmarshaller}
@@ -33,6 +33,10 @@ import wdl.draft2.model.FullyQualifiedName
 import skuber.json.PlayJsonSupportForAkkaHttp._
 import cromwell.backend.impl.vk.VkResponseJsonFormatter._
 import cromwell.core.CromwellFatalExceptionMarker
+import javax.net.ssl.{KeyManager, SSLContext, X509TrustManager}
+import java.security.cert.X509Certificate
+
+import com.typesafe.sslconfig.akka.AkkaSSLConfig
 import org.apache.commons.lang3.exception.ExceptionUtils
 
 sealed trait VkRunStatus {
@@ -93,7 +97,10 @@ class VkAsyncBackendJobExecutionActor(override val standardParams: StandardAsync
   private val namespace = vkConfiguration.namespace
 
 //  private val apiServerUrl = s"https://cci.${vkConfiguration.region}.myhuaweicloud.com"
-  private val apiServerUrl = vkConfiguration.cciURL
+  private val apiServerUrl = vkConfiguration.k8sURL
+  private val k8sType = apiServerUrl.split('.')(0)
+  private val isCCI = (k8sType == "https://cci") || (k8sType == "http://cci") ||(k8sType == "cci")
+
   override lazy val jobTag: String = jobDescriptor.key.tag
 
   override lazy val jobShell: String = workflowDescriptor.workflowOptions.getOrElse("system.job-shell", configurationDescriptor.globalConfig.getString("system.job-shell"))
@@ -241,9 +248,11 @@ class VkAsyncBackendJobExecutionActor(override val standardParams: StandardAsync
         val parser = new JsonParser()
         val jsonObject = parser.parse(source.utf8String)
         val volumes = jsonObject.getAsJsonObject.get("spec").getAsJsonObject.get("template").getAsJsonObject.get("spec").getAsJsonObject.get("volumes").getAsJsonArray
-        for(disk <- runtimeAttributes.disks.get){
-          val flexVolume = s"""{"name":"${disk.name}","flexVolume":{"driver":"huawei.com/fuxidisk","options":{"volumeType":${disk.diskType.hwsTypeName},"volumeSize":${disk.sizeGb}Gi}}}"""
-          volumes.add(parser.parse(flexVolume))
+        if(isCCI){
+          for(disk <- runtimeAttributes.disks.get){
+            val flexVolume = s"""{"name":"${disk.name}","flexVolume":{"driver":"huawei.com/fuxidisk","options":{"volumeType":${disk.diskType.hwsTypeName},"volumeSize":${disk.sizeGb}Gi}}}"""
+            volumes.add(parser.parse(flexVolume))
+          }
         }
         ByteString.fromString(jsonObject.toString, "utf-8")
       })
@@ -419,10 +428,43 @@ class VkAsyncBackendJobExecutionActor(override val standardParams: StandardAsync
     }
   }
 
+  private val trustfulSslContext: SSLContext = {
+    object NoCheckX509TrustManager extends X509TrustManager {
+      override def checkClientTrusted(chain: Array[X509Certificate], authType: String) = ()
+      override def checkServerTrusted(chain: Array[X509Certificate], authType: String) = ()
+      override def getAcceptedIssuers = Array[X509Certificate]()
+    }
+    val context = SSLContext.getInstance("TLS")
+    context.init(Array[KeyManager](), Array(NoCheckX509TrustManager), null)
+    context
+  }
+
   private def makeRequest[A](request: HttpRequest)(implicit um: Unmarshaller[ResponseEntity, A]): Future[A] = {
     for {
       response <- withRetry(() => {
-        val rsp = Await.result(Http().singleRequest(request), Duration.Inf)
+
+        val badSslConfig: AkkaSSLConfig = AkkaSSLConfig().mapSettings(s =>
+          s.withLoose(
+            s.loose
+              .withAcceptAnyCertificate(true)
+              .withDisableHostnameVerification(true)
+          )
+        )
+        val http = Http()
+        val ctx = http.createClientHttpsContext(badSslConfig)
+        val httpsCtx = new HttpsConnectionContext(
+          trustfulSslContext,
+          ctx.sslConfig,
+          ctx.enabledCipherSuites,
+          ctx.enabledProtocols,
+          ctx.clientAuth,
+          ctx.sslParameters
+        )
+        val rsp = if (vkConfiguration.region == "cn-north-7"){
+          Await.result(Http().singleRequest(request, httpsCtx), Duration.Inf)
+        }else{
+          Await.result(Http().singleRequest(request), Duration.Inf)
+        }
         if (rsp.status.isFailure() && rsp.status.intValue() == 429) {
           Future.failed(new RateLimitException(rsp.status.defaultMessage()))
         } else {

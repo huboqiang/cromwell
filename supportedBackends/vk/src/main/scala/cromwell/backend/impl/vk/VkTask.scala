@@ -33,9 +33,13 @@ final case class VkTask(jobDescriptor: BackendJobDescriptor,
     case None =>
       None
   }
-  val cpu = runtimeAttributes.cpu.getOrElse(ram.getOrElse(2.0)/2)
-  val memory = ram.getOrElse(cpu * 2)
-  val resources = if(runtimeAttributes.gpuType.isEmpty && runtimeAttributes.gpuType.isEmpty){
+  private var cpu = runtimeAttributes.cpu.getOrElse(ram.getOrElse(2.0)/2)
+  private var memory = ram.getOrElse(cpu * 2)
+  if (cpu >= 32){
+    cpu = cpu- 0.5
+    memory = memory -1
+  }
+  private val resources = if(runtimeAttributes.gpuType.isEmpty && runtimeAttributes.gpuType.isEmpty){
     Option(Resource.Requirements(
       requests = Map(
         "cpu" -> Quantity(cpu.toString),
@@ -63,25 +67,38 @@ final case class VkTask(jobDescriptor: BackendJobDescriptor,
     ))
   }
 
-  val pvc = if (configurationDescriptor.backendConfig.hasPath("pvc")){
+  private val pvcStr = if (configurationDescriptor.backendConfig.hasPath("pvc")){
     configurationDescriptor.backendConfig.getString("pvc")
   }else{
     ""
   }
-  val mountPath = if (configurationDescriptor.backendConfig.hasPath("dockerRoot")){
-    configurationDescriptor.backendConfig.getString("dockerRoot")
+  private val mountPathStr = if (configurationDescriptor.backendConfig.hasPath("pvcPath")){
+    configurationDescriptor.backendConfig.getString("pvcPath")
   }else{
-    configurationDescriptor.backendConfig.getString("root")
+    ""
   }
+  private val pvcList = pvcStr.split(",")
+  private val mountPathList = mountPathStr.split(",")
+  private var mounts = List[Mount]()
+  private var volumes = List[Volume]()
 
-  var mounts = List[Mount]()
-  if(!pvc.equals("")) {
-    mounts = mounts :+ Mount(
-      name = pvc,
-      mountPath = mountPath
-    )
+  if(!pvcStr.equals("") && pvcList.length == mountPathList.length) {
+    for (i <- 0 until pvcList.length){
+      mounts = mounts :+ Mount(
+        name = pvcList(i),
+        mountPath = mountPathList(i)
+      )
+      volumes = volumes :+ Volume(
+        name = pvcList(i),
+        source = PersistentVolumeClaimRef(
+          claimName = pvcList(i)
+        )
+      )
+    }
   }
-  if(!runtimeAttributes.disks.isEmpty){
+  private val k8sType = configurationDescriptor.backendConfig.getString("k8sURL").split('.')(0)
+  private val isCCI = (k8sType == "https://cci") || (k8sType == "http://cci") ||(k8sType == "cci")
+  if(!runtimeAttributes.disks.isEmpty && isCCI){
     for(disk <- runtimeAttributes.disks.get){
       mounts = mounts :+ Mount(
         name = disk.name,
@@ -89,11 +106,19 @@ final case class VkTask(jobDescriptor: BackendJobDescriptor,
       )
     }
   }
-
+  private val cmdWithObsSideCar =
+    s"""
+       |GCS_EXIT_WRAPPER () {
+       |[ -d /obssidecar/terminate ] && echo > /obssidecar/terminate/${name}
+       |}
+       |trap GCS_EXIT_WRAPPER exit;
+       |
+       |${jobShell} ${commandScriptPath}
+       |""".stripMargin
   val containers = List(Container(
     name = fullyQualifiedTaskName,
     image = dockerImageUsed,
-    command = List(jobShell, commandScriptPath),
+    command = List(jobShell, "-c", cmdWithObsSideCar),
     workingDir = runtimeAttributes.dockerWorkingDir,
     resources = resources,
     volumeMounts = mounts
@@ -102,12 +127,7 @@ final case class VkTask(jobDescriptor: BackendJobDescriptor,
 
   val podSpec = Pod.Spec(
     containers = containers,
-    volumes = if(!pvc.equals("")) List(Volume(
-      name = pvc,
-      source = PersistentVolumeClaimRef(
-        claimName = pvc
-      )
-    )) else Nil,
+    volumes = if(!pvcStr.equals("")) volumes else Nil,
     restartPolicy = RestartPolicy.OnFailure,
     imagePullSecrets = List(LocalObjectReference(
       name = "imagepull-secret"
@@ -128,8 +148,13 @@ final case class VkTask(jobDescriptor: BackendJobDescriptor,
     "gcs.task.name" -> name,
     "gcs.source.name" -> fullyQualifiedTaskName
   )
+  val annotations = Map(
+    "obssidecar-injector-webhook/cpu" -> "0.5",
+    "obssidecar-injector-webhook/memory" -> "1Gi",
+    "obssidecar-injector-webhook/inject" -> "true"
+  )
 
-  val podMetadata = ObjectMeta(name=fullyQualifiedTaskName,labels = labels)
+  val podMetadata = ObjectMeta(name=fullyQualifiedTaskName,labels = labels, annotations = annotations)
 
   val templateSpec = Pod.Template.Spec(metadata=podMetadata).withPodSpec(podSpec)
 
