@@ -24,7 +24,7 @@ class VkFinalizationActor(params: VkFinalizationActorParams)
   extends StandardFinalizationActor(params) {
 
   override def afterAll(): Future[Unit] = {
-    params.vkStatusManager.remove(workflowDescriptor.id.toString)
+    params.vkStatusManager.remove(workflowDescriptor.id)
     super.afterAll()
   }
 }

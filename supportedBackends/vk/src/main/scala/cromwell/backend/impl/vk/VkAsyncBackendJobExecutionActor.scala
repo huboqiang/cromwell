@@ -1,6 +1,6 @@
 package cromwell.backend.impl.vk
 
-import akka.actor.ActorSystem
+import akka.actor.{ActorRef, ActorSystem}
 
 import java.io.FileNotFoundException
 import java.nio.file.FileAlreadyExistsException
@@ -8,13 +8,13 @@ import java.util.concurrent.ExecutionException
 import akka.http.scaladsl.model.headers.RawHeader
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.marshalling.Marshal
-import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
 import akka.http.scaladsl.unmarshalling.{Unmarshal, Unmarshaller}
 import akka.http.scaladsl.model.{RequestEntity, _}
 import akka.stream.ActorMaterializer
 import akka.stream.scaladsl.Flow
 import akka.util.ByteString
-import com.google.gson.{JsonObject, JsonParser}
+import cromwell.services.SuccessfulMetadataJsonResponse
+import com.google.gson.{Gson, JsonObject, JsonParser}
 import cromwell.backend.BackendJobLifecycleActor
 import cromwell.backend.async.{AbortedExecutionHandle, ExecutionHandle, FailedNonRetryableExecutionHandle, FailedRetryableExecutionHandle, PendingExecutionHandle, RetryWithMoreMemory, ReturnCodeIsNotAnInt, StderrNonEmpty, WrongReturnCode}
 import cromwell.backend.standard.{StandardAsyncExecutionActor, StandardAsyncExecutionActorParams, StandardAsyncJob}
@@ -32,9 +32,7 @@ import skuber.batch.Job
 import skuber.json.batch.format._
 import wdl.draft2.model.FullyQualifiedName
 import skuber.json.PlayJsonSupportForAkkaHttp._
-import cromwell.backend.impl.vk.VkResponseJsonFormatter._
-import cromwell.core.CromwellFatalExceptionMarker
-
+import cromwell.core.{CromwellFatalExceptionMarker, WorkflowId}
 import com.typesafe.sslconfig.akka.AkkaSSLConfig
 import org.apache.commons.lang3.exception.ExceptionUtils
 
@@ -108,7 +106,7 @@ class VkAsyncBackendJobExecutionActor(override val standardParams: StandardAsync
   private val isCCI = (k8sType == "https://cci") || (k8sType == "http://cci") ||(k8sType == "cci")
 
   override lazy val jobTag: String = jobDescriptor.key.tag
-
+  private val gson = new Gson()
   override lazy val jobShell: String = workflowDescriptor.workflowOptions.getOrElse("system.job-shell", configurationDescriptor.globalConfig.getString("system.job-shell"))
 
 
@@ -234,7 +232,7 @@ class VkAsyncBackendJobExecutionActor(override val standardParams: StandardAsync
             uri = s"${apiServerUrl}/apis/batch/v1/namespaces/${namespace}/jobs",
             entity = transEntity(entity)))
         } yield {
-          vkStatusManager.setStatus(workflowId, ctr)
+          vkStatusManager.setStatus(workflowId, ctr.name, gson.toJsonTree(ctr).getAsJsonObject)
           PendingExecutionHandle(jobDescriptor, StandardAsyncJob(ctr.name), None, previousState = None)
         }
       } catch {
@@ -295,22 +293,8 @@ class VkAsyncBackendJobExecutionActor(override val standardParams: StandardAsync
         // If the process has already completed, there will be an existing rc file.
         returnCodeTmp.delete(true)
     }
-    val delOptions = scala.collection.mutable.Map(
-      "kind"-> "DeleteOptions",
-      "apiVersion"-> "v1",
-      "propagationPolicy"-> "Background"
-    )
-    Marshal(delOptions).to[RequestEntity] map { entity => {
-        makeRequest[CancelTaskResponse](HttpRequest(method = HttpMethods.DELETE,
-          headers = List(RawHeader("X-Auth-Token", vkConfiguration.token.getValue())),
-          uri = s"${apiServerUrl}/apis/batch/v1/namespaces/${namespace}/jobs/${job.jobId}",
-          entity = entity)) onComplete {
-          case Success(_) => jobLogger.info("{} Aborted {}", tag: Any, job.jobId)
-          case Failure(ex) => jobLogger.warn("{} Failed to abort {}: {}", tag, job.jobId, ex.getMessage)
-        }
-      }
-    }
-    ()
+    vkStatusManager.TryDeleteVkJob(job.jobId)
+    jobLogger.info("{} Aborted {} done", tag: Any, job.jobId)
   }
 
   override def requestsAbortAndDiesImmediately: Boolean = false
@@ -320,33 +304,49 @@ class VkAsyncBackendJobExecutionActor(override val standardParams: StandardAsync
   }
 
   private def pollStatusAsync(jobName: String): Future[VkRunStatus] = {
-    val job = vkStatusManager.getStatus(workflowId, jobName)
-    if(job.isEmpty){
-      Future.failed(new Exception(s"Job ${jobName} is not found!"))
-    }else {
-      val vkRunStatus = {
-        val status = job.get.get("status")
-        if (status.isJsonNull) {
-          Running
-        } else {
-          status.getAsJsonObject match {
-            case s if getVal(s, "failed").getOrElse(0) > 0 =>
-              jobLogger.info(s"VK reported an error for Job ${jobName}: '$s'")
-              FailedOrError
-            case s if getVal(s, "succeeded").getOrElse(0) > 0 =>
-              jobLogger.info(s"Job ${jobName} is complete")
-              Complete
-
-            case s if getVal(s, "active").getOrElse(1) == 0 =>
-              jobLogger.info(s"Job ${jobName} was canceled")
-              Cancelled
-
-            case _ => Running
-          }
+    var job = vkStatusManager.getStatus(workflowId, jobName)
+    var timeNoutFound = 0
+    while (job.isEmpty){
+      println(s"Job ${jobName} is not found, re-fetch ${timeNoutFound} of 3...")
+      Thread.sleep(15000)
+      job = vkStatusManager.getStatus(workflowId, jobName)
+      timeNoutFound += 1
+      if (timeNoutFound > 3){
+        val status = vkStatusManager.getWorkflowStatus(jobDescriptor.workflowDescriptor.id, serviceRegistryActor)
+        if (status == "Aborting" || status == "Aborted"|| status == "Failed"){
+          jobLogger.info(s"Job ${jobName} with status ${status} cannot be fetched for over 150-seconds. Canceled")
+          return Future.successful(Cancelled)
+        }
+        else{
+          return Future.successful(Running)
         }
       }
-      Future.successful(vkRunStatus)
     }
+
+    val vkRunStatus = {
+      val status = job.get.get("status")
+      if (status.isJsonNull) {
+        Running
+      } else {
+        status.getAsJsonObject match {
+          case s if getVal(s, "failed").getOrElse(0) > 0 =>
+            jobLogger.info(s"VK reported an error for Job ${jobName}: '$s'")
+            FailedOrError
+          case s if getVal(s, "succeeded").getOrElse(0) > 0 =>
+            jobLogger.info(s"Job ${jobName} is complete")
+            vkStatusManager.deleteVkJob(jobName)
+            Complete
+
+          case s if getVal(s, "active").getOrElse(1) == 0 =>
+            jobLogger.info(s"Job ${jobName} was canceled")
+            vkStatusManager.deleteVkJob(jobName)
+            Cancelled
+
+          case _ => Running
+        }
+      }
+    }
+    Future.successful(vkRunStatus)
   }
 
   private def getVal(jsObject: JsonObject, key: String): Option[Int] ={
@@ -399,7 +399,32 @@ class VkAsyncBackendJobExecutionActor(override val standardParams: StandardAsync
     }
   }
 
+  def writeMetadataJson(workflowId: WorkflowId, serviceRegistryActor: ActorRef) = {
+    var status = "notStart"
+    val id = workflowId.id
+    val resp = vkStatusManager.getMetadata(workflowId, serviceRegistryActor)
+    Try(Await.ready(resp, 60 seconds)) match {
+      case Success(f) => f.value.get match {
+        case Success(r) =>
+          val path = s"${id}/metadata.json"
+          val absPath = getPath(path) match {
+            case Success(absoluteOutputPath) if absoluteOutputPath.isAbsolute => absoluteOutputPath
+            case _ => vkJobPaths.callExecutionRoot.resolve(path)
+          }
+          Await.result(asyncIo.writeAsync(absPath, r.asInstanceOf[SuccessfulMetadataJsonResponse].responseJson.toString(), Seq.empty), Duration.Inf)
+        case Failure(_) =>
+          status = "Failed"
+      }
+      case Failure(_) => // handle timeout
+    }
+    status.replaceAll("""[,"\s]+(|.*[^,\s])[,"\s]+""", "$1")
+  }
+
   override def mapOutputWomFile(womFile: WomFile): WomFile = {
+//    jobLogger.info(s"mapOutputWomFile start.")
+//    actorSystem.scheduler.scheduleOnce(30 seconds, context.self, "wait 30s for metadata query after finished.")
+//    jobLogger.info(s"mapOutputWomFile get metadata.")
+//    jobLogger.info(s"mapOutputWomFile get metadata done.")
     womFile mapFile { path =>
 //      val path = "/Users/dts/cromwell/cromwell/vk.conf"
       val absPath = getPath(path) match {

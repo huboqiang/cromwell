@@ -1,163 +1,201 @@
 package cromwell.backend.impl.vk
 
 import java.util.Date
-import java.util.concurrent.{ExecutionException, TimeUnit}
-
-import akka.actor.{ActorContext, ActorSystem, Cancellable}
+import akka.actor.{ActorContext, ActorRef, ActorSystem, Props}
 import akka.http.scaladsl.Http
+import akka.http.scaladsl.model.{ContentTypes, HttpEntity, HttpMethods, HttpRequest}
 import akka.http.scaladsl.model.headers.RawHeader
-import akka.http.scaladsl.model.HttpRequest
-import akka.stream.ActorMaterializer
-import akka.util.ByteString
-import com.google.gson.{Gson, JsonObject, JsonParser}
-import com.typesafe.sslconfig.akka.AkkaSSLConfig
-import cromwell.core.CromwellFatalExceptionMarker
-import skuber.batch.Job
-import cromwell.core.retry.Retry._
+import akka.pattern.ask
 
 import scala.collection.concurrent.TrieMap
-import scala.concurrent.duration._
-import scala.concurrent.{Await, ExecutionContextExecutor, Future}
+import akka.util.ByteString
+import com.google.gson.{JsonObject, JsonParser}
+import com.typesafe.sslconfig.akka.AkkaSSLConfig
+import cromwell.core.{CromwellFatalExceptionMarker, WorkflowId}
+import cromwell.core.retry.Retry.withRetry
+import cromwell.core.retry.SimpleExponentialBackoff
+import cromwell.services.{MetadataJsonResponse, SuccessfulMetadataJsonResponse}
+import cromwell.services.keyvalue.KeyValueServiceActor.{KvAction, KvFailure, KvGet, KvKeyLookupFailed, KvPair, KvPut, KvPutSuccess, KvResponse, ScopedKey}
+import cromwell.services.keyvalue.KeyValueServiceActor
+import cromwell.services.metadata.MetadataService.GetSingleWorkflowMetadataAction
 
-final case class VkStatusManager(vkConfiguration: VkConfiguration) {
+import java.util.concurrent.{Executors, TimeUnit}
+import scala.language.postfixOps
+import scala.concurrent.{Await, ExecutionContext, ExecutionContextExecutor, ExecutionException, Future}
+import scala.concurrent.duration.DurationInt
+import scala.util.{Failure, Success, Try}
 
-  val workflowMap = TrieMap[String, VkStatusItem]()
 
-  val scheduledMap = TrieMap[String, Cancellable]()
 
-  def submit(workflowId: String, context: ActorContext): Unit ={
-    println(s"submit ${workflowId}")
-    val item = VkStatusItem(workflowId, context, vkConfiguration)
-    scheduledMap += (workflowId -> item.schedule())
-    workflowMap += (workflowId -> item)
-  }
+class VkStatusManager(vkConfiguration: VkConfiguration){
+  var statusMap = TrieMap[String, TrieMap[String, JsonObject]]()
+  var tmpStatusMap = TrieMap[String, TrieMap[String, JsonObject]]()
 
-  def remove(workflowId: String) ={
-    val cancellable = scheduledMap.get(workflowId)
-    if(!cancellable.isEmpty){
-      println(s"remove ${workflowId}")
-      if(cancellable.get.cancel()){
-        workflowMap.remove(workflowId)
-      }
-    }
-  }
-
-  def getStatus(workflowId: String, jobId: String): Option[JsonObject] = {
-    val item = workflowMap.get(workflowId)
-    if(!item.isEmpty){
-      item.get.getStatus(jobId)
-    }else{
-      None
-    }
-  }
-
-  def setStatus(workflowId: String, job: Job) = {
-    val item = workflowMap.get(workflowId)
-    if(!item.isEmpty){
-      item.get.setStatus(job)
-    }
-  }
-}
-
-object VkStatusItem {
-  val badSslConfig: AkkaSSLConfig = AkkaSSLConfig(ActorSystem.apply()).mapSettings(s =>
+  implicit val system: ActorSystem = ActorSystem()
+  implicit val executionContext: ExecutionContextExecutor = system.dispatcher
+  private val namespace = vkConfiguration.namespace
+  private val apiServerUrl = vkConfiguration.k8sURL
+  private val token = vkConfiguration.token.getValue()
+  private val badSslConfig: AkkaSSLConfig = AkkaSSLConfig(ActorSystem.apply()).mapSettings(s =>
     s.withLoose(
       s.loose
         .withDisableHostnameVerification(true)
     )
   )
-  val badCtx = Http(ActorSystem.apply()).createClientHttpsContext(badSslConfig)
-}
+  private val badCtx = Http(ActorSystem.apply()).createClientHttpsContext(badSslConfig)
+  private val data = """{"kind" : "DeleteOptions", "apiVersion" : "v1",  "propagationPolicy" : "Background" }"""
+  private val entity = HttpEntity(ContentTypes.`application/json`, data.getBytes())
 
-final case class VkStatusItem(workflowId: String, context: ActorContext, vkConfiguration: VkConfiguration, initialDelay: FiniteDuration = FiniteDuration(0, TimeUnit.SECONDS), interval: FiniteDuration = FiniteDuration(10, TimeUnit.SECONDS)) {
+  val runnable = new Runnable {
+    override def run() = {
+      fetch()
+        .onComplete {
+          case Success(_) =>
+          case Failure(_)   => sys.error("something wrong")
+        }
+    }
+  }
+  val service = Executors.newSingleThreadScheduledExecutor()
+  service.scheduleAtFixedRate(runnable, 0, 15, TimeUnit.SECONDS)
 
-  protected implicit def actorSystem: ActorSystem = context.system
-  protected implicit lazy val ec: ExecutionContextExecutor = context.dispatcher
-  protected implicit val materializer = ActorMaterializer()
 
-  // private val parser = new JsonParser()
-  private val gson = new Gson()
-  var statusMap = TrieMap[String, JsonObject]()
-  val tempMap = TrieMap[String, JsonObject]()
-  val scheduler = actorSystem.scheduler
+  def submit(workflowId: String, context: ActorContext): Unit ={
+    println(s"submit ${workflowId}")
+  }
 
-  private val namespace = vkConfiguration.namespace
-  //private val apiServerUrl = s"https://cci.${vkConfiguration.region}.myhuaweicloud.com"
-  private val apiServerUrl = vkConfiguration.k8sURL
-  def getStatus(jobId: String): Option[JsonObject] = {
-    val ret = statusMap.get(jobId)
-    if(ret.isEmpty) {
-      val tmp = tempMap.get(jobId)
-      tmp
+  def getStatus(workflowId: String, jobId: String):Option[JsonObject] = {
+    val r = statusMap.get(workflowId)
+    if (r == None){
+      return None
+    }
+    val jobToJson = r.get.get(jobId)
+    jobToJson
+  }
+
+  def setStatus(workflowId: String, jobId: String, jobObject: JsonObject) = {
+    if (statusMap.contains(workflowId)){
+      val jobToJson = statusMap(workflowId)
+      jobToJson.update(jobId, jobObject)
+      statusMap.update(workflowId, jobToJson)
     }else{
-      tempMap.remove(jobId)
-      ret
+      val jobToJson = TrieMap(jobId -> jobObject)
+      statusMap.update(workflowId, jobToJson)
     }
   }
 
-  def setStatus(job: Job) = {
-    println(s"set  ${job.name}")
-    tempMap.put(job.name, gson.toJsonTree(job).getAsJsonObject)
+  def setStatusTmp(workflowId: String, jobId: String, jobObject: JsonObject) = {
+    if (tmpStatusMap.contains(workflowId)){
+      val jobToJson = tmpStatusMap(workflowId)
+      jobToJson.update(jobId, jobObject)
+      tmpStatusMap.update(workflowId, jobToJson)
+    }else{
+      val jobToJson = TrieMap(jobId -> jobObject)
+      tmpStatusMap.update(workflowId, jobToJson)
+    }
   }
 
-  def schedule()={
-    scheduler.schedule(initialDelay, interval, new Runnable {
-      override def run(): Unit = Await.result(fetch(workflowId), Duration.Inf)
-    })
-  }
-
-  def fetch(workflowId: String)= {
-    println(s"fetch ${workflowId} begin at ${new Date().toString}")
-    makeRequest(HttpRequest(headers = List(RawHeader("X-Auth-Token", vkConfiguration.token.getValue())),
-      uri = s"${apiServerUrl}/apis/batch/v1/namespaces/${namespace}/jobs?labelSelector=gcs-wdlexec-id%3D${workflowId}")) map {
+  def fetch()= {
+    println(s"fetch ${namespace} begin at ${new Date().toString}")
+    tmpStatusMap = TrieMap[String, TrieMap[String, JsonObject]]()
+    makeRequest(HttpRequest(
+      headers = List(RawHeader("X-Auth-Token", token)),
+      uri = s"${apiServerUrl}/apis/batch/v1/namespaces/${namespace}/jobs")) map {
       response => {
-        println(s"fetch ${workflowId} end at ${new Date().toString}")
-        val temp = TrieMap[String, JsonObject]()
+        println(s"fetch ${namespace} end at ${new Date().toString}")
         val jobList = response.get("items").getAsJsonArray
         val iterator = jobList.iterator()
         while(iterator.hasNext){
-          val job = iterator.next().getAsJsonObject
-          temp.put(job.get("metadata").getAsJsonObject.get("name").getAsString,job)
+          val job = iterator.next()
+          val jobMetadata = job.getAsJsonObject.get("metadata").getAsJsonObject
+          if ( jobMetadata.has("name") && jobMetadata.has("labels") ){
+            val jobId = jobMetadata.get("name").getAsString
+            val labelObject = jobMetadata.get("labels").getAsJsonObject
+            if (labelObject.has("gcs-wdlexec-id")){
+                val workflowId = labelObject.get("gcs-wdlexec-id").getAsString
+                setStatusTmp(workflowId, jobId, job.getAsJsonObject)
+            }
+          }
         }
-//        for(job <- jobList){
-//          temp.put(job.name, job)
-//        }
+        statusMap = tmpStatusMap
         println(s"fetch size ${jobList.size}")
-        statusMap = temp
-
       }
     }
   }
 
+  def remove(workflowId: WorkflowId): Unit ={
+    val id = workflowId.id.toString
+    println(s"delete all finished jobs' info in ${id} begin at ${new Date().toString}")
+    val cancellable = statusMap.get(id)
+    if (cancellable.isEmpty){
+      return ()
+    }
+
+    for ( (jobId, _) <- cancellable.get ){
+      var resp = TryDeleteVkJob(jobId)
+      while (resp == "retry"){
+        resp = TryDeleteVkJob(jobId)
+      }
+      if (resp != "notFound") {
+        println(s"kubectl delete job ${jobId} done with status ${resp}.")
+      }
+    }
+    statusMap.remove(id)
+    println(s"delete all all finished jobs' info in ${id} end at ${new Date().toString}")
+  }
+
+  def TryDeleteVkJob(jobId: String): String = {
+    val resp = deleteVkJob(jobId)
+    Try(Await.ready(resp, 100 seconds)) match {
+      case Success(f) => f.value.get match {
+        case Success(_) =>
+          "done"
+        case Failure(ex) =>
+          // Message likes " java.lang.RuntimeException: Failed VK request: Code ErrCode Body = $errorBody ".
+          // Code 429 for keep-retrying until the req/minute level below the limit.
+          val res = ex.getMessage.split(" ")(5) match{
+            case "429" => "retry"
+            case "404" => "notFound"
+            case _ => "failed"
+          }
+          if (res != "notFound"){
+            println(s"delete job ${jobId} failed with ${ex}.")
+          }
+          res
+      }
+      case Failure(_) =>
+        "timeout"
+    }
+  }
+
+  def deleteVkJob(jobId: String): Future[JsonObject] = {
+    makeRequest(HttpRequest(method = HttpMethods.DELETE,
+      headers = List(RawHeader("X-Auth-Token", vkConfiguration.token.getValue())),
+      uri = s"${apiServerUrl}/apis/batch/v1/namespaces/${namespace}/jobs/${jobId}",
+      entity = entity))
+  }
 
   private def makeRequest(request: HttpRequest): Future[JsonObject] = {
     withRetry(() => {
       for {
         // response <- withRetry(() => Http().singleRequest(request))
         response <- if (vkConfiguration.region == "cn-north-7") {
-          withRetry(() => Http().singleRequest(request, VkStatusItem.badCtx))
+          withRetry(() => Http().singleRequest(request, badCtx))
         } else {
           withRetry(() => Http().singleRequest(request))
         }
         data <- if (response.status.isFailure()) {
           response.entity.dataBytes.runFold(ByteString(""))(_ ++ _).map(_.utf8String) flatMap { errorBody =>
-            Future.failed(new RuntimeException(s"Failed VK request: Code ${response.status.intValue()}, Body = $errorBody"))
+            Future.failed(new RuntimeException(s"Failed VK request: Code ${response.status.intValue()} Body = $errorBody"))
           }
         } else {
-          response.entity.withoutSizeLimit.toStrict(100000.millis).map[JsonObject] {
+          response.entity.withoutSizeLimit.toStrict(5000.millis).map[JsonObject] {
             res => {
               JsonParser.parseString(res.data.utf8String).getAsJsonObject
             }
           }
-          //        Unmarshal(response.entity.withoutSizeLimit()).to[A]
-          //        Await.result(response.entity.toStrict(10000.millis).map{
-          //          res =>{
-          //            Unmarshal(CloseDelimited(response.entity.contentType, res.dataBytes)).to[A]
-          //          }
-          //        },Duration.Inf)
         }
       } yield data
-    },isTransient = isTransient)
+    },isTransient = isTransient, maxRetries=Option(3), backoff=SimpleExponentialBackoff(1 seconds, 10 seconds, 2))
   }
 
   def isTransient(throwable: Throwable): Boolean = {
@@ -176,4 +214,62 @@ final case class VkStatusItem(workflowId: String, context: ActorContext, vkConfi
     case e: ExecutionException => Option(e.getCause).exists(isFatal)
     case _ => false
   }
+
+  def getMetadata(workflowId: WorkflowId, serviceRegistryActor: ActorRef): Future[MetadataJsonResponse] = {
+    val readMetadataRequest = (w: WorkflowId) =>
+      GetSingleWorkflowMetadataAction(w, None, None, expandSubWorkflows = true, metadataSourceOverride = None)
+
+    val resp = serviceRegistryActor.ask(readMetadataRequest(workflowId))(600 seconds).mapTo[MetadataJsonResponse]
+    resp
+  }
+
+  def getWorkflowStatus(workflowId: WorkflowId, serviceRegistryActor: ActorRef) = {
+    var status = "notStart"
+    val resp = getMetadata(workflowId, serviceRegistryActor)
+    Try(Await.ready(resp, 60 seconds)) match {
+      case Success(f) => f.value.get match {
+        case Success(r) =>
+          val ss = r.asInstanceOf[SuccessfulMetadataJsonResponse].responseJson
+          status = ss.getFields(("status"))(0).toString()
+        case Failure(_) =>
+          status = "Failed"
+      }
+      case Failure(_) => // handle timeout
+    }
+    status.replaceAll("""[,"\s]+(|.*[^,\s])[,"\s]+""", "$1")
+  }
+
 }
+
+final class InMemoryKvServiceActor extends KeyValueServiceActor {
+  implicit val ec: ExecutionContext = context.dispatcher
+
+  var kvStore = Map.empty[ScopedKey, String]
+
+  override def receive = {
+    case get: KvGet => respond(sender, get, doGet(get))
+    case put: KvPut => respond(sender, put, doPut(put))
+  }
+
+  def doGet(get: KvGet): Future[KvResponse] = kvStore.get(get.key) match {
+    case Some(value) => Future.successful(KvPair(get.key, value))
+    case None => Future.successful(KvKeyLookupFailed(get))
+  }
+
+  def doPut(put: KvPut): Future[KvResponse] = {
+    kvStore += (put.key -> put.pair.value)
+    Future.successful(KvPutSuccess(put))
+  }
+
+  override protected def kvReadActorProps = Props.empty
+
+  override protected def kvWriteActorProps = Props.empty
+
+  private def respond(replyTo: ActorRef, action: KvAction, response: Future[KvResponse]): Unit = {
+    response.onComplete {
+      case Success(x) => replyTo ! x
+      case Failure(ex) => replyTo ! KvFailure(action, ex)
+    }
+  }
+}
+
