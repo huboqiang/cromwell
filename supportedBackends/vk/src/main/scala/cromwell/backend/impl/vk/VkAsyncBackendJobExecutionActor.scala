@@ -334,12 +334,13 @@ class VkAsyncBackendJobExecutionActor(override val standardParams: StandardAsync
             FailedOrError
           case s if getVal(s, "succeeded").getOrElse(0) > 0 =>
             jobLogger.info(s"Job ${jobName} is complete")
-            vkStatusManager.deleteVkJob(jobName)
+            // Let bce-apiserver delete all finished jobs so that bce can get the pod actual running time.
+            // vkStatusManager.deleteVkJob(jobName)
             Complete
 
           case s if getVal(s, "active").getOrElse(1) == 0 =>
             jobLogger.info(s"Job ${jobName} was canceled")
-            vkStatusManager.deleteVkJob(jobName)
+            // vkStatusManager.deleteVkJob(jobName)
             Cancelled
 
           case _ => Running

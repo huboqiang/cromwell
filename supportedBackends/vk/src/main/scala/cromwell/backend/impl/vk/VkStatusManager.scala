@@ -51,7 +51,7 @@ class VkStatusManager(vkConfiguration: VkConfiguration){
       fetch()
         .onComplete {
           case Success(_) =>
-          case Failure(_)   => sys.error("something wrong")
+          case Failure(err)   => sys.error(s"status scheduler error in this round: ${err}")
         }
     }
   }
@@ -124,23 +124,24 @@ class VkStatusManager(vkConfiguration: VkConfiguration){
 
   def remove(workflowId: WorkflowId): Unit ={
     val id = workflowId.id.toString
-    println(s"delete all finished jobs' info in ${id} begin at ${new Date().toString}")
+    println(s"delete all finished jobs' statusMap info in ${id} begin at ${new Date().toString}")
     val cancellable = statusMap.get(id)
     if (cancellable.isEmpty){
       return ()
     }
 
-    for ( (jobId, _) <- cancellable.get ){
-      var resp = TryDeleteVkJob(jobId)
-      while (resp == "retry"){
-        resp = TryDeleteVkJob(jobId)
-      }
-      if (resp != "notFound") {
-        println(s"kubectl delete job ${jobId} done with status ${resp}.")
-      }
-    }
+    // Let bce-apiserver delete all finished jobs so that bce can get the pod actual running time.
+    //  for ( (jobId, _) <- cancellable.get ){
+    //    var resp = TryDeleteVkJob(jobId)
+    //    while (resp == "retry"){
+    //      resp = TryDeleteVkJob(jobId)
+    //    }
+    //    if (resp != "notFound") {
+    //      println(s"kubectl delete job ${jobId} done with status ${resp}.")
+    //    }
+    //  }
     statusMap.remove(id)
-    println(s"delete all all finished jobs' info in ${id} end at ${new Date().toString}")
+    println(s"delete all all finished jobs' statusMap info in ${id} end at ${new Date().toString}")
   }
 
   def TryDeleteVkJob(jobId: String): String = {
