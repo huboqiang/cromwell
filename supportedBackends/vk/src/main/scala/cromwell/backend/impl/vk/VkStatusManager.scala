@@ -35,7 +35,6 @@ class VkStatusManager(vkConfiguration: VkConfiguration){
   implicit val executionContext: ExecutionContextExecutor = system.dispatcher
   private val namespace = vkConfiguration.namespace
   private val apiServerUrl = vkConfiguration.k8sURL
-  private val token = vkConfiguration.token.getValue()
   private val badSslConfig: AkkaSSLConfig = AkkaSSLConfig(ActorSystem.apply()).mapSettings(s =>
     s.withLoose(
       s.loose
@@ -98,7 +97,7 @@ class VkStatusManager(vkConfiguration: VkConfiguration){
     println(s"fetch ${namespace} begin at ${new Date().toString}")
     tmpStatusMap = TrieMap[String, TrieMap[String, JsonObject]]()
     makeRequest(HttpRequest(
-      headers = List(RawHeader("X-Auth-Token", token)),
+      headers = List(RawHeader("X-Auth-Token", vkConfiguration.token.getValue())),
       uri = s"${apiServerUrl}/apis/batch/v1/namespaces/${namespace}/jobs")) map {
       response => {
         println(s"fetch ${namespace} end at ${new Date().toString}")
