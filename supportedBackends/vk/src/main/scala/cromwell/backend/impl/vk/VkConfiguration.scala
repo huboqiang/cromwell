@@ -28,6 +28,7 @@ class VkConfiguration(val configurationDescriptor: BackendConfigurationDescripto
   val runtimeConfig = configurationDescriptor.backendRuntimeAttributesConfig
   val iamURL = configurationDescriptor.backendConfig.getString("iamURL")
   val k8sURL = configurationDescriptor.backendConfig.getString("k8sURL")
+  var maxJob = if(configurationDescriptor.backendConfig.hasPath("concurrent-job-limit")){configurationDescriptor.backendConfig.getString("concurrent-job-limit").toInt}else{1000}
 //  var iamURL = s"https://iam.${region}.myhuaweicloud.com"
 //  var k8sURL = s"https://cci.${region}.myhuaweicloud.com"
 //  if(region == "cn-north-7"){

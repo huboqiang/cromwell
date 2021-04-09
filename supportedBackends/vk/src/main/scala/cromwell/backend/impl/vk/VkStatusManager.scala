@@ -19,6 +19,7 @@ import cromwell.services.keyvalue.KeyValueServiceActor.{KvAction, KvFailure, KvG
 import cromwell.services.keyvalue.KeyValueServiceActor
 import cromwell.services.metadata.MetadataService.GetSingleWorkflowMetadataAction
 
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.{Executors, TimeUnit}
 import scala.language.postfixOps
 import scala.concurrent.{Await, ExecutionContext, ExecutionContextExecutor, ExecutionException, Future}
@@ -30,6 +31,7 @@ import scala.util.{Failure, Success, Try}
 class VkStatusManager(vkConfiguration: VkConfiguration){
   var statusMap = TrieMap[String, TrieMap[String, JsonObject]]()
   var tmpStatusMap = TrieMap[String, TrieMap[String, JsonObject]]()
+  var jobNumber = new AtomicInteger(0);
 
   implicit val system: ActorSystem = ActorSystem()
   implicit val executionContext: ExecutionContextExecutor = system.dispatcher
@@ -116,7 +118,9 @@ class VkStatusManager(vkConfiguration: VkConfiguration){
           }
         }
         statusMap = tmpStatusMap
-        println(s"fetch size ${jobList.size}")
+        jobNumber.set(jobList.size)
+        println(s"fetch size ${jobNumber.get()}")
+        updateJobQuotaLimit()
       }
     }
   }
@@ -164,6 +168,26 @@ class VkStatusManager(vkConfiguration: VkConfiguration){
       }
       case Failure(_) =>
         "timeout"
+    }
+  }
+
+  private def updateJobQuotaLimit() = {
+    val resQuota = makeRequest(HttpRequest(method = HttpMethods.GET,
+      headers = List(RawHeader("X-Auth-Token", vkConfiguration.token.getValue())),
+      uri = s"${apiServerUrl}/api/v1/namespaces/${namespace}/resourcequotas/compute-resources",
+      entity = entity))
+
+    var nJobQuota = -1
+    resQuota.onComplete {
+        case Success(resp) =>
+          nJobQuota = resp.get("spec").getAsJsonObject.get("hard").getAsJsonObject.get("count/jobs.batch").getAsInt
+          println(s"Update concurrent-job-limit to current k8s quota: count/jobs.batch=${vkConfiguration.maxJob}")
+        case Failure(err)   =>
+          println(s"Quota query failed with ${err}.")
+      }
+
+    if (nJobQuota > 0){
+      vkConfiguration.maxJob = nJobQuota
     }
   }
 

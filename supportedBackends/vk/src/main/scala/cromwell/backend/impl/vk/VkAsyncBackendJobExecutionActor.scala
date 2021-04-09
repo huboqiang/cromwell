@@ -307,7 +307,7 @@ class VkAsyncBackendJobExecutionActor(override val standardParams: StandardAsync
     var job = vkStatusManager.getStatus(workflowId, jobName)
     var timeNoutFound = 0
     while (job.isEmpty){
-      println(s"Job ${jobName} is not found, re-fetch ${timeNoutFound} of 3...")
+      println(s"Job ${jobName} not found, re-fetch ${timeNoutFound} of 3...")
       Thread.sleep(15000)
       job = vkStatusManager.getStatus(workflowId, jobName)
       timeNoutFound += 1
@@ -318,7 +318,8 @@ class VkAsyncBackendJobExecutionActor(override val standardParams: StandardAsync
           return Future.successful(Cancelled)
         }
         else{
-          return Future.successful(Running)
+          jobLogger.info(s"Job ${jobName} with status ${status} but K8S job cannot be detected for over 150-seconds. Failed.")
+          return Future.successful(FailedOrError)
         }
       }
     }
@@ -462,7 +463,14 @@ class VkAsyncBackendJobExecutionActor(override val standardParams: StandardAsync
   private def makeRequest[A](request: HttpRequest)(implicit um: Unmarshaller[ResponseEntity, A]): Future[A] = {
     for {
       response <- withRetry(() => {
-
+        val nJobs = vkStatusManager.jobNumber.get()
+        val maxJob = vkConfiguration.maxJob
+        if (nJobs > maxJob){
+          val messageTooManyJobs = s"The concurrent-job-limit is ${maxJob}, current job num is ${nJobs}. So stop submission."
+          return Future.failed(RateLimitException(s"Too many VK requests: ${messageTooManyJobs}"))
+        }
+        // increase job counter in avoid of too many jobs' creation made fetch un-work so counter not update.
+        vkStatusManager.jobNumber.incrementAndGet()
         val rsp = if (vkConfiguration.region == "cn-north-7"){
           Await.result(Http().singleRequest(request, VkAsyncBackendJobExecutionActor.badCtx), Duration.Inf)
         }else{
