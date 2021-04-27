@@ -307,20 +307,19 @@ class VkAsyncBackendJobExecutionActor(override val standardParams: StandardAsync
     var job = vkStatusManager.getStatus(workflowId, jobName)
     var timeNoutFound = 0
     while (job.isEmpty){
-      println(s"Job ${jobName} not found, re-fetch ${timeNoutFound} of 3...")
+      val status = vkStatusManager.getWorkflowStatus(jobDescriptor.workflowDescriptor.id, serviceRegistryActor)
+      if (status == "Aborting" || status == "Aborted"|| status == "Failed"){
+        jobLogger.info(s"Job ${jobName} with status ${status} cannot be fetched. Canceled")
+        return Future.successful(Cancelled)
+      }
+
+      println(s"Job ${jobName} not found, re-fetch ${timeNoutFound} of 240 every 15 seconds...")
       Thread.sleep(15000)
       job = vkStatusManager.getStatus(workflowId, jobName)
       timeNoutFound += 1
-      if (timeNoutFound > 3){
-        val status = vkStatusManager.getWorkflowStatus(jobDescriptor.workflowDescriptor.id, serviceRegistryActor)
-        if (status == "Aborting" || status == "Aborted"|| status == "Failed"){
-          jobLogger.info(s"Job ${jobName} with status ${status} cannot be fetched for over 150-seconds. Canceled")
-          return Future.successful(Cancelled)
-        }
-        else{
-          jobLogger.info(s"Job ${jobName} with status ${status} but K8S job cannot be detected for over 150-seconds. Failed.")
+      if (timeNoutFound > 240){
+          jobLogger.info(s"Job ${jobName} with status ${status} but K8S job cannot be detected for over 60-minutes. Failed.")
           return Future.successful(FailedOrError)
-        }
       }
     }
 

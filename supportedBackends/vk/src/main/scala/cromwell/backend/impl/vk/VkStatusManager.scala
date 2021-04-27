@@ -183,7 +183,10 @@ class VkStatusManager(vkConfiguration: VkConfiguration){
           nJobQuota = resp.get("spec").getAsJsonObject.get("hard").getAsJsonObject.get("count/jobs.batch").getAsInt
           println(s"Update concurrent-job-limit to current k8s quota: count/jobs.batch=${vkConfiguration.maxJob}")
         case Failure(err)   =>
-          println(s"Quota query failed with ${err}.")
+          val errCode = err.getMessage.split("\\s+")(5)
+          if (errCode != "404"){
+            println(s"Quota query failed with ${err}.")
+          }
       }
 
     if (nJobQuota > 0){
