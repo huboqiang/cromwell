@@ -5,7 +5,7 @@ import cromwell.core.path.Path
 import skuber.Resource.Quantity
 import skuber.Volume.{Mount, PersistentVolumeClaimRef}
 import skuber.batch.Job
-import skuber.{Container, LocalObjectReference, ObjectMeta, Pod, Resource, RestartPolicy, Volume}
+import skuber.{Container, LocalObjectReference, ObjectMeta, Pod, PodSecurityContext, Resource, RestartPolicy, Volume}
 import wdl4s.parser.MemoryUnit
 
 final case class VkTask(jobDescriptor: BackendJobDescriptor,
@@ -14,7 +14,8 @@ final case class VkTask(jobDescriptor: BackendJobDescriptor,
                         runtimeAttributes: VkRuntimeAttributes,
                         containerWorkDir: Path,
                         dockerImageUsed: String,
-                        jobShell: String) {
+                        jobShell: String,
+                        vkConfiguration: VkConfiguration) {
 
   private val workflowDescriptor = jobDescriptor.workflowDescriptor
   private val workflowId = workflowDescriptor.id
@@ -96,8 +97,8 @@ final case class VkTask(jobDescriptor: BackendJobDescriptor,
       )
     }
   }
-  private val k8sType = configurationDescriptor.backendConfig.getString("k8sURL").split('.')(0)
-  private val isCCI = (k8sType == "https://cci") || (k8sType == "http://cci") ||(k8sType == "cci")
+
+  private val isCCI = vkConfiguration.isCCI
   if(!runtimeAttributes.disks.isEmpty && isCCI){
     for(disk <- runtimeAttributes.disks.get){
       mounts = mounts :+ Mount(
@@ -125,13 +126,19 @@ final case class VkTask(jobDescriptor: BackendJobDescriptor,
   ))
 
   var imagePullSecretsName = "imagepull-secret"
+  var secContext = PodSecurityContext()
   if (!isCCI) {
+    val uid = Some(vkConfiguration.uid.toInt)
+    val gid = Some(vkConfiguration.gid.toInt)
+    val fid = Some(vkConfiguration.fid.toInt)
+    secContext = PodSecurityContext(runAsUser=uid, runAsGroup=gid, fsGroup=fid)
     imagePullSecretsName = "default-secret"
   }
   val podSpec = Pod.Spec(
     containers = containers,
     volumes = if(!pvcStr.equals("")) volumes else Nil,
     restartPolicy = RestartPolicy.OnFailure,
+    securityContext = Some(secContext),
     imagePullSecrets = List(LocalObjectReference(
       name = imagePullSecretsName
     ))

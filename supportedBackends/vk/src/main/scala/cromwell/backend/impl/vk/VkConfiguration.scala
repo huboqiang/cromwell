@@ -36,6 +36,13 @@ class VkConfiguration(val configurationDescriptor: BackendConfigurationDescripto
 //    k8sURL = "https://cci.cn-north-7.myhuaweicloud.com"
 //  }
   val token = Token(accessKey, secretKey, region, iamURL)
+  private val k8sType = k8sURL.split('.')(0)
+  val isCCI = (k8sType == "https://cci") || (k8sType == "http://cci") ||(k8sType == "cci")
+
+  val sysInfo = new com.sun.security.auth.module.UnixSystem()
+  val uid = sysInfo.getUid
+  val gid = sysInfo.getGid
+  val fid = sysInfo.getUid
 
 }
 

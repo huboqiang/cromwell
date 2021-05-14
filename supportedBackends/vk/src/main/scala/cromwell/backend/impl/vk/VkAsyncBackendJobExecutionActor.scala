@@ -102,8 +102,6 @@ class VkAsyncBackendJobExecutionActor(override val standardParams: StandardAsync
 
 //  private val apiServerUrl = s"https://cci.${vkConfiguration.region}.myhuaweicloud.com"
   private val apiServerUrl = vkConfiguration.k8sURL
-  private val k8sType = apiServerUrl.split('.')(0)
-  private val isCCI = (k8sType == "https://cci") || (k8sType == "http://cci") ||(k8sType == "cci")
 
   override lazy val jobTag: String = jobDescriptor.key.tag
   private val gson = new Gson()
@@ -166,7 +164,8 @@ class VkAsyncBackendJobExecutionActor(override val standardParams: StandardAsync
       runtimeAttributes,
       commandDirectory,
       dockerImageUsed.get,
-      jobShell
+      jobShell,
+      vkConfiguration
     )
     Future.successful(task.job)
   }
@@ -251,7 +250,7 @@ class VkAsyncBackendJobExecutionActor(override val standardParams: StandardAsync
       val flow = Flow.fromFunction[ByteString, ByteString](source => {
         val jsonObject = JsonParser.parseString(source.utf8String)
         val volumes = jsonObject.getAsJsonObject.get("spec").getAsJsonObject.get("template").getAsJsonObject.get("spec").getAsJsonObject.get("volumes").getAsJsonArray
-        if(isCCI){
+        if(vkConfiguration.isCCI){
           for(disk <- runtimeAttributes.disks.get){
             val flexVolume = s"""{"name":"${disk.name}","flexVolume":{"driver":"huawei.com/fuxidisk","options":{"volumeType":${disk.diskType.hwsTypeName},"volumeSize":${disk.sizeGb}Gi}}}"""
             volumes.add(JsonParser.parseString(flexVolume))
