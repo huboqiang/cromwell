@@ -252,8 +252,8 @@ class VkAsyncBackendJobExecutionActor(override val standardParams: StandardAsync
         val volumes = jsonObject.getAsJsonObject.get("spec").getAsJsonObject.get("template").getAsJsonObject.get("spec").getAsJsonObject.get("volumes").getAsJsonArray
         if(vkConfiguration.isCCI){
           for(disk <- runtimeAttributes.disks.get){
-            val flexVolume = s"""{"name":"${disk.name}","flexVolume":{"driver":"huawei.com/fuxidisk","options":{"volumeType":${disk.diskType.hwsTypeName},"volumeSize":${disk.sizeGb}Gi}}}"""
-            volumes.add(JsonParser.parseString(flexVolume))
+            val emptyDir = s"""{"name":"${disk.name}","emptyDir":{"medium":${disk.diskType.hwsTypeName},"sizeLimit":${disk.sizeGb}Gi}}"""
+            volumes.add(JsonParser.parseString(emptyDir))
           }
         }
         ByteString.fromString(jsonObject.toString, "utf-8")

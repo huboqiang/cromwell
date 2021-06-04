@@ -2,11 +2,11 @@ package cromwell.backend.impl.vk;
 
 
 public enum VkDiskType {
-    LOCAL("LOCAL", "ssd"),
-    SSD("SSD", "ssd"),
-    HDD("HDD", "sas"),
-    SATA("SATA", "sata"),
-    SAS("SAS", "sas");
+    LOCAL("LOCAL", "LocalVolume"),
+    SSD("SSD", "LocalSSD"),
+    HDD("HDD", "LocalVolume"),
+    SATA("SATA", "LocalVolume"),
+    SAS("SAS", "LocalVolume");
 
     public final String diskTypeName;
     public final String hwsTypeName;
