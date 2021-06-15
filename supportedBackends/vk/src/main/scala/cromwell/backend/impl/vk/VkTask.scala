@@ -3,7 +3,7 @@ package cromwell.backend.impl.vk
 import cromwell.backend.{BackendConfigurationDescriptor, BackendJobDescriptor}
 import cromwell.core.path.Path
 import skuber.Resource.Quantity
-import skuber.Volume.{Mount, PersistentVolumeClaimRef}
+import skuber.Volume.{HostPath, Mount, PersistentVolumeClaimRef}
 import skuber.batch.Job
 import skuber.{Container, LocalObjectReference, ObjectMeta, Pod, PodSecurityContext, Resource, RestartPolicy, Volume}
 import wdl4s.parser.MemoryUnit
@@ -83,22 +83,35 @@ final case class VkTask(jobDescriptor: BackendJobDescriptor,
   private var mounts = List[Mount]()
   private var volumes = List[Volume]()
 
+  private val isCCI = vkConfiguration.isCCI
   if(!pvcStr.equals("") && pvcList.length == mountPathList.length) {
     for (i <- 0 until pvcList.length){
-      mounts = mounts :+ Mount(
-        name = pvcList(i),
-        mountPath = mountPathList(i)
+      val pvcName = pvcList(i)
+      val mountPath = mountPathList(i)
+      val mountElem = Mount(
+        name = pvcName,
+        mountPath = mountPath
       )
-      volumes = volumes :+ Volume(
-        name = pvcList(i),
+      var volumeElem = Volume(
+        name = pvcName,
         source = PersistentVolumeClaimRef(
           claimName = pvcList(i)
         )
       )
+      if(!isCCI && pvcName.slice(0, 8).toLowerCase() == "hostpath") {
+        volumeElem = Volume(
+          name = pvcName,
+          source = HostPath(
+            path = mountPath,
+            `type` = Option("")
+          )
+        )
+      }
+      mounts = mounts :+ mountElem
+      volumes = volumes :+ volumeElem
     }
   }
 
-  private val isCCI = vkConfiguration.isCCI
   if(!runtimeAttributes.disks.isEmpty && isCCI){
     for(disk <- runtimeAttributes.disks.get){
       mounts = mounts :+ Mount(
